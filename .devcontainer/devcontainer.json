@@ -1,0 +1,5 @@
+{
+	"name": "zk-battleship",
+	"image": "mcr.microsoft.com/devcontainers/base:alpine-3.22",
+	"postCreateCommand": "sudo apk add --no-cache rust cargo"
+}
