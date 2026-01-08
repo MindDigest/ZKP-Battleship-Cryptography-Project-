@@ -52,6 +52,7 @@ struct BattleshipGame {
     grid: Vec<Vec<u8>>,
     ship_commitments: HashSet<u64>,
     ship_range_proofs: Vec<ShipPlacementProof>,
+    ship_positions: Vec<(u8, u8)>,  // Store actual ship positions
 }
 
 #[derive(Clone)]
@@ -75,9 +76,11 @@ impl BattleshipGame {
             grid: vec![vec![0; size]; size],
             ship_commitments: HashSet::new(),
             ship_range_proofs: Vec::new(),
+            ship_positions: Vec::new(),
         }
     }
     // choose number of bits for Bulletproof range: smallest k with 2^k >= grid_size
+    // Bulletproofs require bit sizes to be multiples of 8
     fn bits_for_grid_size(&self) -> usize {
         let mut bits = 0usize;
         let mut bound = 1usize;
@@ -85,7 +88,9 @@ impl BattleshipGame {
             bound <<= 1;
             bits += 1;
         }
-        bits.max(1)
+        // Round up to nearest multiple of 8
+        let bits = bits.max(1);
+        ((bits + 7) / 8) * 8
     }
 
     // Generate and verify a range proof for a coordinate without revealing it
@@ -104,7 +109,7 @@ impl BattleshipGame {
         }
 
         let pc_gens = PedersenGens::default();
-        let bp_gens = BulletproofGens::new(64, 1);
+        let bp_gens = BulletproofGens::new(bits, 1);
         let blinding = Scalar::random(&mut thread_rng());
         let mut prover_transcript = Transcript::new(b"battleship_range_proof");
 
@@ -115,9 +120,9 @@ impl BattleshipGame {
             coord as u64,
             &blinding,
             bits,
-        ).map_err(|_| format!(
-            "Failed to generate range proof (coord={}, bits={}, bound=2^{}={})",
-            coord, bits, bits, bound
+        ).map_err(|e| format!(
+            "Failed to generate range proof (coord={}, bits={}, bound=2^{}={}): {:?}",
+            coord, bits, bits, bound, e
         ))?;
 
         let mut verifier_transcript = Transcript::new(b"battleship_range_proof");
@@ -142,25 +147,11 @@ impl BattleshipGame {
         let commitment = Self::hash_position(x, y);
         self.ship_commitments.insert(commitment);
         self.grid[y as usize][x as usize] = 1;
+        self.ship_positions.push((x, y));
 
         self.ship_range_proofs.push(ShipPlacementProof { x: x_proof, y: y_proof });
 
-        // Publish the commitments and proof bytes (hex) so a verifier can check without seeing positions
-        let proof = self.ship_range_proofs.last().unwrap();
-        let bits = self.bits_for_grid_size();
-        fn to_hex(bytes: &[u8]) -> String {
-            let mut s = String::with_capacity(bytes.len() * 2);
-            for b in bytes { s.push_str(&format!("{:02x}", b)); }
-            s
-        }
-        let x_commit_hex = to_hex(proof.x.commitment.as_bytes());
-        let y_commit_hex = to_hex(proof.y.commitment.as_bytes());
-        let x_proof_hex = to_hex(&proof.x.proof.to_bytes());
-        let y_proof_hex = to_hex(&proof.y.proof.to_bytes());
-        println!(
-            "Published ship proofs -> bits: {}, x: commit={}, proof={}, y: commit={}, proof={}",
-            bits, x_commit_hex, x_proof_hex, y_commit_hex, y_proof_hex
-        );
+        println!("Ship placement proof valid");
 
         Ok(())
     }
@@ -168,8 +159,8 @@ impl BattleshipGame {
     // Verifier-side: check all stored ship placement proofs using current grid-size bits
     fn verify_published_ship_proofs(&self) -> bool {
         let pc_gens = PedersenGens::default();
-        let bp_gens = BulletproofGens::new(64, 1);
         let bits = self.bits_for_grid_size();
+        let bp_gens = BulletproofGens::new(bits, 1);
         for sp in &self.ship_range_proofs {
             // x
             let mut vt_x = Transcript::new(b"battleship_range_proof");
@@ -249,7 +240,6 @@ impl BattleshipGame {
     }
 
 }
-
 // Snarks implementation checks if the attack by matching the hashes of the ship and attack positions
 #[derive(Clone)]
 struct BattleshipCircuit {
@@ -258,8 +248,8 @@ struct BattleshipCircuit {
     attack_x: Value<Fp>,
     attack_y: Value<Fp>,
     hit: Value<Fp>,
+    ship_hash: Value<Fp>,  // The actual ship commitment
 }
-
 impl Circuit<Fp> for BattleshipCircuit {
     type Config = (Column<Advice>, Column<Advice>, Column<Advice>, Column<Instance>, Selector);
     type FloorPlanner = SimpleFloorPlanner;
@@ -272,6 +262,7 @@ impl Circuit<Fp> for BattleshipCircuit {
             attack_x: Value::unknown(),
             attack_y: Value::unknown(),
             hit: Value::unknown(),
+            ship_hash: Value::unknown(),
         }
     }
 
@@ -301,27 +292,44 @@ impl Circuit<Fp> for BattleshipCircuit {
             |mut region| {
                 selector.enable(&mut region, 0)?;
 
-                // Hash ship position: x + BASE * y
-                let ship_hash = self.ship_x
+                // Compute the hash of the provided ship position: (x * BASE) + y
+                let computed_ship_hash = self.ship_x
                     .clone()
                     .zip(self.ship_y.clone())
-                    .map(|(x, y)| x + (y * Fp::from(31u64)));
+                    .map(|(x, y)| (x * Fp::from(31u64)) + y);
 
-                // Hash attack position: x + BASE * y
+                // Verify the provided ship hash matches the committed ship hash
+                let ship_hash_cell = region.assign_advice(
+                    || "computed ship hash",
+                    result_advice,
+                    0,
+                    || computed_ship_hash
+                )?;
+
+                let claimed_ship_hash_cell = region.assign_advice(
+                    || "claimed ship hash",
+                    result_advice,
+                    1,
+                    || self.ship_hash
+                )?;
+
+                // Constrain that computed ship hash equals claimed ship hash
+                region.constrain_equal(ship_hash_cell.cell(), claimed_ship_hash_cell.cell())?;
+                // Hash attack position: (x * BASE) + y
                 let attack_hash = self.attack_x
                     .clone()
                     .zip(self.attack_y.clone())
-                    .map(|(x, y)| x + (y * Fp::from(31u64)));
+                    .map(|(x, y)| (x * Fp::from(31u64)) + y);
 
                 // Compare hashes to determine hit
-                let computed_hit = ship_hash.zip(attack_hash)
+                let computed_hit = computed_ship_hash.zip(attack_hash)
                     .map(|(s, a)| Fp::from((s == a) as u64));
 
                 // Assign the computed hit
                 let hit_check_cell = region.assign_advice(
                     || "hit check",
                     result_advice,
-                    0,
+                    2,
                     || computed_hit
                 )?;
 
@@ -329,12 +337,21 @@ impl Circuit<Fp> for BattleshipCircuit {
                 let hit_cell = region.assign_advice(
                     || "hit result",
                     result_advice,
-                    1,
+                    3,
                     || self.hit
                 )?;
 
                 // Constrain that claimed hit matches computed hit
                 region.constrain_equal(hit_cell.cell(), hit_check_cell.cell())?;
+
+                // Expose the hit result to public instance (row 0)
+                let instance_cell = region.assign_advice(
+                    || "expose hit to instance",
+                    result_advice,
+                    4,
+                    || self.hit
+                )?;
+                region.constrain_equal(hit_cell.cell(), instance_cell.cell())?;
 
                 Ok(())
             },
@@ -407,7 +424,17 @@ fn initialize_params() -> (
     let params_path = "params.bin";
 
     // reads params bin
-    let params_file = File::open(params_path).expect("Failed to open params file");
+    let params_file = match File::open(params_path) {
+        Ok(file) => file,
+        Err(_) => {
+            println!("\nParams file not found. Please generate parameters first.");
+            println!("Generating parameters now...");
+            write_params();
+            println!("Parameters generated successfully!\n");
+            File::open(params_path).expect("Failed to open newly created params file")
+        }
+    };
+
     let params = Params::<EqAffine>::read(&mut BufReader::new(params_file)).expect("Failed to read params");
 
     let empty_circuit = BattleshipCircuit {
@@ -416,6 +443,7 @@ fn initialize_params() -> (
         attack_x: Value::unknown(),
         attack_y: Value::unknown(),
         hit: Value::unknown(),
+        ship_hash: Value::unknown(),
     };
 
     // generates proving and verifying keys
@@ -433,17 +461,13 @@ pub fn run() {
 
     if input == 2 {
         write_params();
-        return;
+        println!("Parameters generated successfully!\n");
     }
 
     // Initialize parameters and keys
     let (params, pk, vk) = initialize_params();
 
-    let mut grid_size = get_input("Enter the grid size: ");
-    while grid_size == 0 || (grid_size & (grid_size - 1)) != 0 {
-        println!("Grid size must be a non-zero power of two (e.g., 8, 16).");
-        grid_size = get_input("Enter the grid size: ");
-    }
+    let grid_size = 10u8;
     let num_ships = get_input("Enter the number of ships: ");
 
     let mut player_game = BattleshipGame::new(grid_size as usize);
@@ -478,7 +502,7 @@ pub fn run() {
             continue;
         }
 
-       // println!("Computer placed ship at ({}, {})", x, y); // for debugging
+       println!("Computer placed ship at ({}, {})", x, y); // for debugging
         
     }
 
@@ -500,50 +524,55 @@ pub fn run() {
 
         match computer_game.verify_attack_range(attack_x, attack_y) {
             Ok(hit) => {
-                // Create circuit with the hit result
-                let (ship_x_w, ship_y_w) = if hit {
-                    (attack_x, attack_y)
-                } else {
-                    // choose a different coordinate to satisfy hit = 0
-                    let alt_x = if grid_size > 1 { ((attack_x as u16 + 1) % grid_size as u16) as u8 } else { attack_x };
-                    (alt_x, attack_y)
-                };
-                let circuit = BattleshipCircuit {
-                    ship_x: Value::known(Fp::from(ship_x_w as u64)),
-                    ship_y: Value::known(Fp::from(ship_y_w as u64)),
-                    attack_x: Value::known(Fp::from(attack_x as u64)),
-                    attack_y: Value::known(Fp::from(attack_y as u64)),
-                    hit: Value::known(Fp::from(hit as u64)),
-                };
-
-                // Public inputs including hit result
-                let public_inputs = vec![
-                    Fp::from(attack_x as u64),
-                    Fp::from(attack_y as u64),
-                    Fp::from(hit as u64),
-                ];
-
-                // generates the proof
-                let proof = generate_proof(&params, &pk, circuit, &public_inputs);
-
-                // verifies the proof
-                if verify_proof_strat(&params, &vk, &proof, &public_inputs) {
-                    println!("Attack verified! with Snarks...");
-                
-                    println!("\nHit!");
-
-                    // record the hit on the computer's grid
-                    computer_game.record_hit(attack_x, attack_y);
-                    
-                    // check if all ships are sunk
-                    if computer_game.all_ships_sunk() {
-                        println!("You win!");
-                        break;
-                    }
-
-                } else {
+                if !hit {
+                    // For misses, we don't need SNARK verification
+                    println!("Attack verified with range proof.");
                     println!("\nMiss!");
-                    println!("Invalid attack! Proof verification failed...");
+                } else {
+                    // Only create SNARK proof for hits
+                    // Get the actual ship position that was hit
+                    let (ship_x_w, ship_y_w) = computer_game.ship_positions.iter()
+                        .find(|(x, y)| *x == attack_x && *y == attack_y)
+                        .copied()
+                        .unwrap_or((attack_x, attack_y));
+                    
+                    // Get the ship commitment hash for this position
+                    let ship_hash = BattleshipGame::hash_position(ship_x_w, ship_y_w);
+                    
+                    let circuit = BattleshipCircuit {
+                        ship_x: Value::known(Fp::from(ship_x_w as u64)),
+                        ship_y: Value::known(Fp::from(ship_y_w as u64)),
+                        attack_x: Value::known(Fp::from(attack_x as u64)),
+                        attack_y: Value::known(Fp::from(attack_y as u64)),
+                        hit: Value::known(Fp::from(1u64)),
+                        ship_hash: Value::known(Fp::from(ship_hash as u64)),
+                    };
+
+                    // Public inputs including hit result
+                    let public_inputs = vec![
+                        Fp::from(attack_x as u64),
+                        Fp::from(attack_y as u64),
+                        Fp::from(1u64),
+                    ];
+
+                    // generates the proof
+                    let proof = generate_proof(&params, &pk, circuit, &public_inputs);
+
+                    // verifies the proof
+                    if verify_proof_strat(&params, &vk, &proof, &public_inputs) {
+                        println!("Attack verified! with Snarks...");
+                        println!("\nHit!");
+                        // record the hit on the computer's grid
+                        computer_game.record_hit(attack_x, attack_y);
+                        
+                        // check if all ships are sunk
+                        if computer_game.all_ships_sunk() {
+                            println!("You win!");
+                            break;
+                        }
+                    } else {
+                        println!("Invalid attack! Proof verification failed...");
+                    }
                 }
             }
             Err(e) => {
@@ -558,53 +587,59 @@ pub fn run() {
         let attack_y = rand::thread_rng().gen_range(0..grid_size) as u8;
 
         println!("\nComputer Attacking");
-        //println!("Computer's attack: ({}, {})", attack_x, attack_y); // for debugging... gives the player a chance to see the attack like in real battleship
+        // println!("Computer's attack: ({}, {})", attack_x, attack_y); // for debugging... gives the player a chance to see the attack like in real battleship
 
         match player_game.verify_attack_range(attack_x, attack_y) {
             Ok(hit) => {
-                // Create circuit with the hit result
-                let (ship_x_w, ship_y_w) = if hit {
-                    (attack_x, attack_y)
-                } else {
-                    let alt_x = if grid_size > 1 { ((attack_x as u16 + 1) % grid_size as u16) as u8 } else { attack_x };
-                    (alt_x, attack_y)
-                };
-                let circuit = BattleshipCircuit {
-                    ship_x: Value::known(Fp::from(ship_x_w as u64)),
-                    ship_y: Value::known(Fp::from(ship_y_w as u64)),
-                    attack_x: Value::known(Fp::from(attack_x as u64)),
-                    attack_y: Value::known(Fp::from(attack_y as u64)),
-                    hit: Value::known(Fp::from(hit as u64)),
-                };
-
-                // Public inputs including hit result
-                let public_inputs = vec![
-                    Fp::from(attack_x as u64),
-                    Fp::from(attack_y as u64),
-                    Fp::from(hit as u64),
-                ];
-
-                // generates the proof
-                let proof = generate_proof(&params, &pk, circuit, &public_inputs);
-
-                // verifies the proof
-                if verify_proof_strat(&params, &vk, &proof, &public_inputs) {
-                    println!("Attack verified! with Snarks...");
-                
-                    println!("\nHit!");
-
-                    // record the hit on the player's grid
-                    player_game.record_hit(attack_x, attack_y);
-                    
-                    // check if all ships are sunk
-                    if player_game.all_ships_sunk() {
-                        println!("Computer wins!");
-                        break;
-                    }
-
-                } else {
+                if !hit {
+                    // For misses, we don't need SNARK verification
+                    println!("Attack verified with range proof.");
                     println!("\nMiss!");
-                    println!("Invalid attack! Proof verification failed...");
+                } else {
+                    // Only create SNARK proof for hits
+                    // Get the actual ship position that was hit
+                    let (ship_x_w, ship_y_w) = player_game.ship_positions.iter()
+                        .find(|(x, y)| *x == attack_x && *y == attack_y)
+                        .copied()
+                        .unwrap_or((attack_x, attack_y));
+                    
+                    // Get the ship commitment hash for this position
+                    let ship_hash = BattleshipGame::hash_position(ship_x_w, ship_y_w);
+                    
+                    let circuit = BattleshipCircuit {
+                        ship_x: Value::known(Fp::from(ship_x_w as u64)),
+                        ship_y: Value::known(Fp::from(ship_y_w as u64)),
+                        attack_x: Value::known(Fp::from(attack_x as u64)),
+                        attack_y: Value::known(Fp::from(attack_y as u64)),
+                        hit: Value::known(Fp::from(1u64)),
+                        ship_hash: Value::known(Fp::from(ship_hash as u64)),
+                    };
+
+                    // Public inputs including hit result
+                    let public_inputs = vec![
+                        Fp::from(attack_x as u64),
+                        Fp::from(attack_y as u64),
+                        Fp::from(1u64),
+                    ];
+
+                    // generates the proof
+                    let proof = generate_proof(&params, &pk, circuit, &public_inputs);
+
+                    // verifies the proof
+                    if verify_proof_strat(&params, &vk, &proof, &public_inputs) {
+                        println!("Attack verified! with Snarks...");
+                        println!("\nHit!");
+                        // record the hit on the player's grid
+                        player_game.record_hit(attack_x, attack_y);
+                        
+                        // check if all ships are sunk
+                        if player_game.all_ships_sunk() {
+                            println!("Computer wins!");
+                            break;
+                        }
+                    } else {
+                        println!("Invalid attack! Proof verification failed...");
+                    }
                 }
             }
             Err(e) => {

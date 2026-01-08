@@ -14,7 +14,7 @@ fn main() {
     match choice.trim() {
         "1" => game1::run(),
         _ => {
-            println!("Please choose 1 or 2.");
+            println!("Please choose 1.");
             return;
         }
     };
