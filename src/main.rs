@@ -4,6 +4,8 @@ mod game1 {
     include!("main_halo2_bulletproofs.rs");
 }
 
+mod korrekt_analysis;
+
 fn main() {
     println!("Choose the mode for the Battleship game:");
     println!("1. SNARKs (Halo2/Bulletproofs)");

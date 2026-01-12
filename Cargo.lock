@@ -764,6 +764,7 @@ dependencies = [
 name = "zk-battleship"
 version = "0.1.0"
 dependencies = [
+ "blake2",
  "bulletproofs",
  "curve25519-dalek",
  "halo2_proofs",

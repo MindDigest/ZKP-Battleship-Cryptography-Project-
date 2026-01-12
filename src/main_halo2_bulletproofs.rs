@@ -1,12 +1,19 @@
 // crates: rand, halo2_proofs, pasta_curves,.. and some others I didnt end up using here after testing them out a bit
 // the Zordle game was a really good reference for me to understand how to implement a halo2 snarks ZK proof and there's also the halo2 book
 // rust install guide... I'm also using rust analyzer on vscode (really good btw.. super responsive and helpful actually)
-// https://www.rust-lang.org/tools/install
+    // https://www.rust-lang.org/tools/install
 // some coding references for snarks ZKP in rust using halo2_proofs
-// https://github.com/nalinbhardwaj/zordle/blob/main/circuits/src/main.rs
-// https://zcash.github.io/halo2/concepts/arithmetization.html
+    // https://github.com/nalinbhardwaj/zordle/blob/main/circuits/src/main.rs
+    // https://zcash.github.io/halo2/concepts/arithmetization.html
 // some coding references for bulletproofs ZKP in rust using using curve25519_dalek, bulletproofs, merlin
-// https://github.com/dalek-cryptography/bulletproofs
+    // https://github.com/dalek-cryptography/bulletproofs
+
+// additional references since readjusting the code
+// Blake2 hashing documentation 
+    // https://www.blake2.net/
+    // https://en.wikipedia.org/wiki/BLAKE_(hash_function)#BLAKE2
+    // https://docs.rs/blake2/latest/blake2/
+
 
 // cargo.toml contents
 // [package]
@@ -21,9 +28,11 @@
 // bulletproofs = "5.0.0"
 // curve25519-dalek = "4.1.3"
 // merlin = "3.0.0"
+// blake2 = "0.10.0"
+
 
 // dependencies
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::stdin;
 use std::fs::File;
 use std::io::BufReader;
@@ -31,6 +40,9 @@ use std::io::BufReader;
 use rand::Rng;
 use rand::rngs::OsRng;
 use rand::thread_rng;
+use rand::RngCore; // for fill_bytes
+
+use blake2::{Blake2b512, Digest};
 
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
@@ -47,10 +59,17 @@ use bulletproofs::{BulletproofGens, PedersenGens, RangeProof};
 use curve25519_dalek::{scalar::Scalar, ristretto::CompressedRistretto};
 use merlin::Transcript;
 
+// Cryptographic commitment structure for ship positions
+#[derive(Clone, Debug)]
+struct ShipCommitment {
+    commitment_hash: [u8; 64],  // Blake2b-512 hash output
+    salt: [u8; 32],             // Random blinding factor (kept secret until reveal)
+}
+
 struct BattleshipGame {
     grid_size: usize,
     grid: Vec<Vec<u8>>,
-    ship_commitments: HashSet<u64>,
+    ship_commitments: HashMap<[u8; 64], ShipCommitment>,  // Map commitment hash to full commitment
     ship_range_proofs: Vec<ShipPlacementProof>,
     ship_positions: Vec<(u8, u8)>,  // Store actual ship positions
 }
@@ -74,7 +93,7 @@ impl BattleshipGame {
         BattleshipGame {
             grid_size: size,
             grid: vec![vec![0; size]; size],
-            ship_commitments: HashSet::new(),
+            ship_commitments: HashMap::new(),
             ship_range_proofs: Vec::new(),
             ship_positions: Vec::new(),
         }
@@ -139,13 +158,13 @@ impl BattleshipGame {
         Ok(CoordinateProof { commitment, proof })
     }
 
-    // hashes the position of the ship, stores it, and publishes range proofs for coordinates
+    // Creates cryptographic commitment for ship position and stores it with range proofs
     fn place_ship(&mut self, x: u8, y: u8) -> Result<(), String> {
         let x_proof = self.prove_coordinate_range(x)?;
         let y_proof = self.prove_coordinate_range(y)?;
 
-        let commitment = Self::hash_position(x, y);
-        self.ship_commitments.insert(commitment);
+        let commitment = Self::commit_position(x, y);
+        self.ship_commitments.insert(commitment.commitment_hash, commitment);
         self.grid[y as usize][x as usize] = 1;
         self.ship_positions.push((x, y));
 
@@ -185,13 +204,15 @@ impl BattleshipGame {
     }
 
     // verifies the attack by checking if the coordinates are in range
-    // and if the ship_commitments set contains the hash of the position
+    // and if any ship commitment matches this position
     fn verify_attack_range(&mut self, x: u8, y: u8) -> Result<bool, String> {
         self.prove_coordinate_range(x)?;
         self.prove_coordinate_range(y)?;
 
-        let commitment = Self::hash_position(x, y);
-        let hit = self.ship_commitments.contains(&commitment);
+        // Check if any stored commitment matches this position
+        let hit = self.ship_commitments.values().any(|commitment| {
+            Self::verify_commitment(x, y, &commitment.salt, &commitment.commitment_hash)
+        });
 
         Ok(hit)
     }
@@ -229,18 +250,50 @@ impl BattleshipGame {
         }
     }
     
-    // hashes an x and y coordinate to a u64
-    fn hash_position(x: u8, y: u8) -> u64 {
-        const BASE: u64 = 31;
-        let mut hash = 0u64;
-        hash += x as u64;
-        hash = hash * BASE;
-        hash += y as u64;
+    // Creates a cryptographically secure commitment to a position using Blake2b with random salt
+    fn commit_position(x: u8, y: u8) -> ShipCommitment {
+        // Generate a random 32-byte salt for blinding
+        let mut salt = [0u8; 32];
+        OsRng.fill_bytes(&mut salt);
+
+        let commitment_hash = Self::compute_commitment(x, y, &salt);
+
+        ShipCommitment {
+            commitment_hash,
+            salt,
+        }
+    }
+
+    // Computes Blake2b hash of position with salt
+    fn compute_commitment(x: u8, y: u8, salt: &[u8; 32]) -> [u8; 64] {
+        let mut hasher = Blake2b512::new();
+        hasher.update(&[x]);
+        hasher.update(&[y]);
+        hasher.update(salt);
+        let result = hasher.finalize();
+        
+        let mut hash = [0u8; 64];
+        hash.copy_from_slice(&result);
         hash
     }
 
+    // Verifies that a position matches a commitment
+    fn verify_commitment(x: u8, y: u8, salt: &[u8; 32], commitment: &[u8; 64]) -> bool {
+        let computed = Self::compute_commitment(x, y, salt);
+        computed == *commitment
+    }
+
+    // Helper function to get commitment for a specific ship position (for SNARK circuit)
+    fn get_commitment_for_position(&self, x: u8, y: u8) -> Option<&ShipCommitment> {
+        self.ship_commitments.values().find(|commitment| {
+            Self::verify_commitment(x, y, &commitment.salt, &commitment.commitment_hash)
+        })
+    }
+
 }
-// Snarks implementation checks if the attack by matching the hashes of the ship and attack positions
+// SNARK circuit verifies that attack coordinates match ship coordinates
+// Note: With Blake2b commitments, we verify coordinate equality directly in the circuit
+// The commitment verification happens outside the circuit (off-chain)
 #[derive(Clone)]
 struct BattleshipCircuit {
     ship_x: Value<Fp>,
@@ -248,7 +301,6 @@ struct BattleshipCircuit {
     attack_x: Value<Fp>,
     attack_y: Value<Fp>,
     hit: Value<Fp>,
-    ship_hash: Value<Fp>,  // The actual ship commitment
 }
 impl Circuit<Fp> for BattleshipCircuit {
     type Config = (Column<Advice>, Column<Advice>, Column<Advice>, Column<Instance>, Selector);
@@ -262,7 +314,6 @@ impl Circuit<Fp> for BattleshipCircuit {
             attack_x: Value::unknown(),
             attack_y: Value::unknown(),
             hit: Value::unknown(),
-            ship_hash: Value::unknown(),
         }
     }
 
@@ -285,51 +336,58 @@ impl Circuit<Fp> for BattleshipCircuit {
 
     // synthesizes the circuit
     fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fp>) -> Result<(), Error> {
-        let (_ship_coords, _attack_coords, result_advice, _result_instance, selector) = config;
+        let (ship_coords, attack_coords, result_advice, _result_instance, selector) = config;
 
         layouter.assign_region(
             || "verify attack",
             |mut region| {
                 selector.enable(&mut region, 0)?;
 
-                // Compute the hash of the provided ship position: (x * BASE) + y
-                let computed_ship_hash = self.ship_x
-                    .clone()
-                    .zip(self.ship_y.clone())
-                    .map(|(x, y)| (x * Fp::from(31u64)) + y);
-
-                // Verify the provided ship hash matches the committed ship hash
-                let ship_hash_cell = region.assign_advice(
-                    || "computed ship hash",
-                    result_advice,
+                // Assign ship coordinates
+                let ship_x_cell = region.assign_advice(
+                    || "ship x",
+                    ship_coords,
                     0,
-                    || computed_ship_hash
+                    || self.ship_x
                 )?;
 
-                let claimed_ship_hash_cell = region.assign_advice(
-                    || "claimed ship hash",
-                    result_advice,
+                let ship_y_cell = region.assign_advice(
+                    || "ship y",
+                    ship_coords,
                     1,
-                    || self.ship_hash
+                    || self.ship_y
                 )?;
 
-                // Constrain that computed ship hash equals claimed ship hash
-                region.constrain_equal(ship_hash_cell.cell(), claimed_ship_hash_cell.cell())?;
-                // Hash attack position: (x * BASE) + y
-                let attack_hash = self.attack_x
-                    .clone()
-                    .zip(self.attack_y.clone())
-                    .map(|(x, y)| (x * Fp::from(31u64)) + y);
+                // Assign attack coordinates
+                let attack_x_cell = region.assign_advice(
+                    || "attack x",
+                    attack_coords,
+                    0,
+                    || self.attack_x
+                )?;
 
-                // Compare hashes to determine hit
-                let computed_hit = computed_ship_hash.zip(attack_hash)
+                let attack_y_cell = region.assign_advice(
+                    || "attack y",
+                    attack_coords,
+                    1,
+                    || self.attack_y
+                )?;
+
+                // Compute if coordinates match: hit = (ship_x == attack_x) AND (ship_y == attack_y)
+                let x_match = self.ship_x.zip(self.attack_x)
                     .map(|(s, a)| Fp::from((s == a) as u64));
+                
+                let y_match = self.ship_y.zip(self.attack_y)
+                    .map(|(s, a)| Fp::from((s == a) as u64));
+                
+                let computed_hit = x_match.zip(y_match)
+                    .map(|(x, y)| x * y); // Both must be 1 for hit
 
                 // Assign the computed hit
                 let hit_check_cell = region.assign_advice(
                     || "hit check",
                     result_advice,
-                    2,
+                    0,
                     || computed_hit
                 )?;
 
@@ -337,18 +395,18 @@ impl Circuit<Fp> for BattleshipCircuit {
                 let hit_cell = region.assign_advice(
                     || "hit result",
                     result_advice,
-                    3,
+                    1,
                     || self.hit
                 )?;
 
                 // Constrain that claimed hit matches computed hit
                 region.constrain_equal(hit_cell.cell(), hit_check_cell.cell())?;
 
-                // Expose the hit result to public instance (row 0)
+                // Expose the hit result to public instance
                 let instance_cell = region.assign_advice(
                     || "expose hit to instance",
                     result_advice,
-                    4,
+                    2,
                     || self.hit
                 )?;
                 region.constrain_equal(hit_cell.cell(), instance_cell.cell())?;
@@ -443,7 +501,6 @@ fn initialize_params() -> (
         attack_x: Value::unknown(),
         attack_y: Value::unknown(),
         hit: Value::unknown(),
-        ship_hash: Value::unknown(),
     };
 
     // generates proving and verifying keys
@@ -536,23 +593,17 @@ pub fn run() {
                         .copied()
                         .unwrap_or((attack_x, attack_y));
                     
-                    // Get the ship commitment hash for this position
-                    let ship_hash = BattleshipGame::hash_position(ship_x_w, ship_y_w);
-                    
                     let circuit = BattleshipCircuit {
                         ship_x: Value::known(Fp::from(ship_x_w as u64)),
                         ship_y: Value::known(Fp::from(ship_y_w as u64)),
                         attack_x: Value::known(Fp::from(attack_x as u64)),
                         attack_y: Value::known(Fp::from(attack_y as u64)),
                         hit: Value::known(Fp::from(1u64)),
-                        ship_hash: Value::known(Fp::from(ship_hash as u64)),
                     };
 
                     // Public inputs including hit result
                     let public_inputs = vec![
-                        Fp::from(attack_x as u64),
-                        Fp::from(attack_y as u64),
-                        Fp::from(1u64),
+                        Fp::from(1u64),  // hit result
                     ];
 
                     // generates the proof
@@ -603,23 +654,17 @@ pub fn run() {
                         .copied()
                         .unwrap_or((attack_x, attack_y));
                     
-                    // Get the ship commitment hash for this position
-                    let ship_hash = BattleshipGame::hash_position(ship_x_w, ship_y_w);
-                    
                     let circuit = BattleshipCircuit {
                         ship_x: Value::known(Fp::from(ship_x_w as u64)),
                         ship_y: Value::known(Fp::from(ship_y_w as u64)),
                         attack_x: Value::known(Fp::from(attack_x as u64)),
                         attack_y: Value::known(Fp::from(attack_y as u64)),
                         hit: Value::known(Fp::from(1u64)),
-                        ship_hash: Value::known(Fp::from(ship_hash as u64)),
                     };
 
                     // Public inputs including hit result
                     let public_inputs = vec![
-                        Fp::from(attack_x as u64),
-                        Fp::from(attack_y as u64),
-                        Fp::from(1u64),
+                        Fp::from(1u64),  // hit result
                     ];
 
                     // generates the proof
