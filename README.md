@@ -1,6 +1,8 @@
-# ZKP BattleShip (BulletProofs and Snarks) all you really need is the main.rs and main_halo2_bulletproofs.rs
+# ZKP BattleShip (BulletProofs and Snarks) 
 
-# Codespace is a thing for this but its a work in progress and currently doens't work without your own efforts in setting it up
+all you really need is the main.rs and main_halo2_bulletproofs.rs
+
+Codespace is a thing for this but its a work in progress and currently doens't work without your own efforts in setting it up
 
 A battleship game using zero-knowledge proofs (zkSNARKs) to verify hits/misses without revealing ship positions.
 
