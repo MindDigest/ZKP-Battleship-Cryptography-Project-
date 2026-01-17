@@ -2,6 +2,8 @@
 // the Zordle game was a really good reference for me to understand how to implement a halo2 snarks ZK proof and there's also the halo2 book
 // rust install guide... I'm also using rust analyzer on vscode (really good btw.. super responsive and helpful actually)
     // https://www.rust-lang.org/tools/install
+    // https://www.scs.stanford.edu/~zyedidia/docs/rust/rust_book.pdf
+    // https://zcash.github.io/halo2/index.html
 // some coding references for snarks ZKP in rust using halo2_proofs
     // https://github.com/nalinbhardwaj/zordle/blob/main/circuits/src/main.rs
     // https://zcash.github.io/halo2/concepts/arithmetization.html
@@ -9,11 +11,9 @@
     // https://github.com/dalek-cryptography/bulletproofs
 
 // additional references since readjusting the code
-// Blake2 hashing documentation 
-    // https://www.blake2.net/
-    // https://en.wikipedia.org/wiki/BLAKE_(hash_function)#BLAKE2
-    // https://docs.rs/blake2/latest/blake2/
-
+// Poseiden hashing documentation 
+    // https://docs.rs/halo2_gadgets/latest/halo2_gadgets/#chips
+    // https://docs.rs/halo2_gadgets/latest/halo2_gadgets/poseidon/index.html
 
 // cargo.toml contents
 // [package]
@@ -23,13 +23,12 @@
 
 // [dependencies]
 // halo2_proofs = "0.3.0"
+// halo2_gadgets = "0.3.0"
 // rand = "0.8"
 // halo2curves = "0.8.0"
 // bulletproofs = "5.0.0"
 // curve25519-dalek = "4.1.3"
 // merlin = "3.0.0"
-// blake2 = "0.10.0"
-
 
 // dependencies
 use std::io::stdin;
@@ -38,7 +37,6 @@ use std::io::BufReader;
 
 use rand::Rng;
 use rand::rngs::OsRng;
-use rand::thread_rng;
 use rand::RngCore;
 
 use halo2_gadgets::poseidon::{
@@ -152,7 +150,7 @@ impl BattleshipGame {
 
         let pc_gens = PedersenGens::default();
         let bp_gens = BulletproofGens::new(bits, 1);
-        let blinding = Scalar::random(&mut thread_rng());
+        let blinding = Scalar::random(&mut OsRng);
         let mut prover_transcript = Transcript::new(b"battleship_range_proof");
 
         let (proof, commitment) = RangeProof::prove_single(
@@ -374,13 +372,14 @@ impl Circuit<Fp> for BattleshipCircuit {
         // enables equality constraints on columns that will use constrain_equal or else Halo2 will panic
         meta.enable_equality(advice);
         meta.enable_equality(result);
+        meta.enable_equality(instance);
 
         (poseidon_config, advice, result, instance, selector)
     }
 
     fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fp>) -> Result<(), Error> {
 
-        let (poseidon_config, advice_col, result_col, _instance_col, selector) = config;
+        let (poseidon_config, advice_col, result_col, instance_col, selector) = config;
 
         // verify each ship's commitment
 
@@ -470,8 +469,9 @@ impl Circuit<Fp> for BattleshipCircuit {
                 });
         }
 
-        layouter.assign_region(
-            || "verify_hit_claim",
+        // Verify hit and expose to instance column in single region
+        let hit_cell = layouter.assign_region(
+            || "verify_and_expose_hit",
             |mut region| {
                 selector.enable(&mut region, 0)?;
 
@@ -493,19 +493,12 @@ impl Circuit<Fp> for BattleshipCircuit {
 
                 // contraint for proof computed must equal claimed
                 region.constrain_equal(computed_cell.cell(), claimed_cell.cell())?;
-                
-                // exposes hit result as public input (instance column)
-                let _instance_cell = region.assign_advice(
-                    || "hit_instance",
-                    result_col,
-                    2,
-                    || self.hit,
-                )?;
 
-                Ok(())
+                Ok(computed_cell)
             },
-
         )?;
+        
+        layouter.constrain_instance(hit_cell.cell(), instance_col, 0)?;
 
         Ok(())
 
@@ -656,7 +649,7 @@ pub fn run() {
         let x = rand::thread_rng().gen_range(0..grid_size) as u8;
         let y = rand::thread_rng().gen_range(0..grid_size) as u8;
 
-        // println!("Computer's ship at: ({}, {})", x, y); // for debugging... reveals computer ship positions
+        println!("Computer's ship at: ({}, {})", x, y); // for debugging... reveals computer ship positions
         
         if computer_game.place_ship(x, y).is_err() {
             // if placement fails try again
