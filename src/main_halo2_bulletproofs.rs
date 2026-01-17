@@ -15,6 +15,10 @@
     // https://docs.rs/halo2_gadgets/latest/halo2_gadgets/#chips
     // https://docs.rs/halo2_gadgets/latest/halo2_gadgets/poseidon/index.html
 
+// adding iszero chip as a gate to resolve a security issue in my circuit which can be found here and this is also my iszero synthesis/config logic reference
+    // https://github.com/icemelon/halo2-examples/blob/master/src/is_zero.rs
+    // https://github.com/nalinbhardwaj/zordle/blob/main/circuits/src/wordle/wordle/is_zero.rs
+
 // cargo.toml contents
 // [package]
 // name = "zk-battleship"
@@ -38,6 +42,10 @@ use std::io::BufReader;
 use rand::Rng;
 use rand::rngs::OsRng;
 use rand::RngCore;
+
+// iszero chip imports has some overlap with other halo2 imports fix below if needed
+use halo2_proofs::{circuit::*, plonk::*, poly::Rotation};
+use halo2curves::ff::Field;
 
 use halo2_gadgets::poseidon::{
     primitives::{ConstantLength, P128Pow5T3, Hash as PoseidonPrimitiveHash},
@@ -306,6 +314,76 @@ impl BattleshipGame {
     }
 
 }
+
+// IsZero chip implementation for Halo2
+// used to securely check if a value is zero within the circuit
+// check out the references at the top of the file for more info as this was adapted from other people's work
+// only adjustments were to field types and imports due to halo2 version differences
+
+#[derive(Clone, Debug)]
+pub struct IsZeroConfig<F> {
+    pub value_inv: Column<Advice>,
+    pub is_zero_expr: Expression<F>,
+}
+
+impl<F: Field> IsZeroConfig<F> {
+    pub fn expr(&self) -> Expression<F> {
+        self.is_zero_expr.clone()
+    }
+}
+
+pub struct IsZeroChip<F: Field> {
+    config: IsZeroConfig<F>,
+}
+
+impl<F: Field> IsZeroChip<F> {
+    pub fn construct(config: IsZeroConfig<F>) -> Self {
+        IsZeroChip { config }
+    }
+
+    pub fn configure(
+        meta: &mut ConstraintSystem<F>,
+        q_enable: impl FnOnce(&mut VirtualCells<'_, F>) -> Expression<F>,
+        value: impl FnOnce(&mut VirtualCells<'_, F>) -> Expression<F>,
+        value_inv: Column<Advice>,
+    ) -> IsZeroConfig<F> {
+        let mut is_zero_expr = Expression::Constant(F::ZERO);
+
+        meta.create_gate("is_zero", |meta| {
+            //
+            // valid | value |  value_inv |  1 - value * value_inv | value * (1 - value* value_inv)
+            // ------+-------+------------+------------------------+-------------------------------
+            //  yes  |   x   |    1/x     |         0              |  0
+            //  no   |   x   |    0       |         1              |  x
+            //  yes  |   0   |    0       |         1              |  0
+            //  yes  |   0   |    y       |         1              |  0
+            //
+            let value = value(meta);
+            let q_enable = q_enable(meta);
+            let value_inv = meta.query_advice(value_inv, Rotation::cur());
+
+            is_zero_expr = Expression::Constant(F::ONE) - value.clone() * value_inv;
+            vec![q_enable * value * is_zero_expr.clone()]
+        });
+
+        IsZeroConfig {
+            value_inv,
+            is_zero_expr,
+        }
+    }
+
+    pub fn assign(
+        &self,
+        region: &mut Region<'_, F>,
+        offset: usize,
+        value: Value<F>,
+    ) -> Result<(), Error> {
+        let value_inv = value.map(|value| value.invert().unwrap_or(F::ZERO));
+        region.assign_advice(|| "value inv", self.config.value_inv, offset, || value_inv)?;
+        Ok(())
+    }
+}
+
 // SNARK circuit verifies that attack coordinates match ship coordinates
 #[derive(Clone)]
 struct BattleshipCircuit {
@@ -317,7 +395,19 @@ struct BattleshipCircuit {
 }
 
 impl Circuit<Fp> for BattleshipCircuit {
-    type Config = (Pow5Config<Fp, 3, 2>, Column<Advice>, Column<Advice>, Column<Instance>, Selector);
+
+    type Config = (
+        Pow5Config<Fp, 3, 2>,
+        Column<Advice>,        // advice_col
+        Column<Advice>,        // result_col
+        Column<Advice>,        // diff_col
+        Column<Advice>,        // value_inv_col
+        Column<Advice>,        // is_zero_result_col
+        Column<Instance>,
+        IsZeroConfig<Fp>,      // IsZero config
+        Selector,              // q_is_zero selector
+    );
+
     type FloorPlanner = SimpleFloorPlanner;
 
     // no witnesses are needed for the circuit
@@ -366,20 +456,57 @@ impl Circuit<Fp> for BattleshipCircuit {
 
         let advice = meta.advice_column();
         let result = meta.advice_column();
+        let diff_col = meta.advice_column();
+        let value_inv_col = meta.advice_column();
+        let is_zero_result_col = meta.advice_column();
         let instance = meta.instance_column();
-        let selector = meta.selector();
+        let q_is_zero = meta.selector();
 
         // enables equality constraints on columns that will use constrain_equal or else Halo2 will panic
         meta.enable_equality(advice);
         meta.enable_equality(result);
+        meta.enable_equality(diff_col);
+        meta.enable_equality(value_inv_col);
+        meta.enable_equality(is_zero_result_col);
         meta.enable_equality(instance);
 
-        (poseidon_config, advice, result, instance, selector)
+        // Configure IsZero using diff_col as the value input and q_is_zero as selector
+        let is_zero_config = IsZeroChip::<Fp>::configure(
+            meta,
+            |meta| meta.query_selector(q_is_zero),
+            |meta| meta.query_advice(diff_col, Rotation::cur()),
+            value_inv_col,
+        );
+
+        (
+            poseidon_config,
+            advice,
+            result,
+            diff_col,
+            value_inv_col,
+            is_zero_result_col,
+            instance,
+            is_zero_config,
+            q_is_zero,
+        )
     }
 
     fn synthesize(&self, config: Self::Config, mut layouter: impl Layouter<Fp>) -> Result<(), Error> {
 
-        let (poseidon_config, advice_col, result_col, instance_col, selector) = config;
+        let (
+            poseidon_config,
+            advice_col,
+            result_col,
+            diff_col,
+            value_inv_col,
+            is_zero_result_col,
+            instance_col,
+            is_zero_config,
+            q_is_zero,
+        ) = config;
+
+        // prep IsZero chip
+        let is_zero_chip = IsZeroChip::construct(is_zero_config.clone());
 
         // verify each ship's commitment
 
@@ -447,43 +574,122 @@ impl Circuit<Fp> for BattleshipCircuit {
             )?;
         }
 
-        // Computes whether any ship matches attack
+        // Computes whether any ship matches attack using IsZero constraints
 
-        let mut computed_hit = Value::known(Fp::zero());
+        let mut ship_match_cells = Vec::new();
         
-        for (ship_x, ship_y, _salt) in &self.ships {
-            // Checks if ship[i] matches the attack coordinates
-            let this_ship_matches = ship_x.zip(self.attack_x)
-                .zip(ship_y.zip(self.attack_y))
-                .map(|((sx, ax), (sy, ay))| {
-                    let x_eq = if sx == ax { Fp::one() } else { Fp::zero() };
-                    let y_eq = if sy == ay { Fp::one() } else { Fp::zero() };
-                    x_eq * y_eq  // AND logic both must be 1
-                });
+        for (i, (ship_x, ship_y, _salt)) in self.ships.iter().enumerate() {
+            // Checks X coordinate
+            let x_diff = ship_x.zip(self.attack_x).map(|(sx, ax)| sx - ax);
             
-            // computed_hit = computed_hit OR this_ship_matches
-            // boolean OR which is a + b - a*b
-            computed_hit = computed_hit.zip(this_ship_matches)
-                .map(|(acc, matches)| {
-                    acc + matches - (acc * matches)
-                });
+            let x_is_zero = layouter.assign_region(
+                || format!("check_x_{}", i),
+                |mut region| {
+                    q_is_zero.enable(&mut region, 0)?;
+                    
+                    // Assign difference
+                    region.assign_advice(|| "x_diff", diff_col, 0, || x_diff)?;
+                    
+                    // Assign value_inv via IsZero chip
+                    is_zero_chip.assign(&mut region, 0, x_diff)?;
+                    
+                    // Compute is_zero value for x
+                    let is_zero_value = x_diff.map(|d| {
+                        if d.is_zero_vartime() { Fp::ONE } else { Fp::ZERO }
+                    });
+                    
+                    region.assign_advice(
+                        || "x_is_zero",
+                        is_zero_result_col,
+                        0,
+                        || is_zero_value,
+                    )
+                },
+            )?;
+
+            // Checks Y coordinate
+            let y_diff = ship_y.zip(self.attack_y).map(|(sy, ay)| sy - ay);
+            
+            let y_is_zero = layouter.assign_region(
+                || format!("check_y_{}", i),
+                |mut region| {
+                    q_is_zero.enable(&mut region, 0)?;
+                    region.assign_advice(|| "y_diff", diff_col, 0, || y_diff)?;
+                    is_zero_chip.assign(&mut region, 0, y_diff)?;
+                    
+                    let is_zero_value = y_diff.map(|d| {
+                        if d.is_zero_vartime() { Fp::ONE } else { Fp::ZERO }
+                    });
+                    
+                    region.assign_advice(
+                        || "y_is_zero",
+                        is_zero_result_col,
+                        0,
+                        || is_zero_value,
+                    )
+                },
+            )?;
+
+            // ship_matches = x_is_zero AND y_is_zero
+            let ship_matches = layouter.assign_region(
+                || format!("combine_xy_{}", i),
+                |mut region| {
+                    let x_val = x_is_zero.value().copied();
+                    let y_val = y_is_zero.value().copied();
+                    let and_result = x_val.zip(y_val).map(|(x, y)| x * y);
+                    
+                    region.assign_advice(|| "ship_matches", result_col, 0, || and_result)
+                },
+            )?;
+
+            ship_match_cells.push(ship_matches);
         }
 
-        // Verify hit and expose to instance column in single region
+        // OR all ship matches: hit = match_0 OR match_1 OR ... OR match_n
+        // Uses boolean OR formula: a OR b = a + b - a*b
+        let computed_hit = layouter.assign_region(
+            || "compute_overall_hit",
+            |mut region| {
+                if ship_match_cells.is_empty() {
+                    // No ships:  return 0 (miss)
+                    region.assign_advice(
+                        || "computed_hit_empty",
+                        result_col,
+                        0,
+                        || Value::known(Fp::ZERO),
+                    )
+                } else {
+                    // Compute OR of all ship matches
+                    let mut acc = ship_match_cells[0].value().copied();
+                    for cell in ship_match_cells.iter().skip(1) {
+                        let match_val = cell.value().copied();
+                        acc = acc.zip(match_val).map(|(a, m)| a + m - (a * m));
+                    }
+                    
+                    region.assign_advice(
+                        || "computed_hit",
+                        result_col,
+                        0,
+                        || acc,
+                    )
+                }
+            },
+        )?;
+
+        // verify hit and expose to instance column in single region
         let hit_cell = layouter.assign_region(
             || "verify_and_expose_hit",
             |mut region| {
-                selector.enable(&mut region, 0)?;
-
-                // assigns computed hit value (from circuit logic)
+                // copy the computed_hit cell
+                let computed_value = computed_hit.value().copied();
+                
                 let computed_cell = region.assign_advice(
-                    || "computed_hit",
+                    || "computed_hit_copy",
                     result_col,
                     0,
-                    || computed_hit,
+                    || computed_value,
                 )?;
 
-                // assigns claimed hit value (public input)
                 let claimed_cell = region.assign_advice(
                     || "claimed_hit",
                     result_col,
@@ -491,19 +697,16 @@ impl Circuit<Fp> for BattleshipCircuit {
                     || self.hit,
                 )?;
 
-                // contraint for proof computed must equal claimed
                 region.constrain_equal(computed_cell.cell(), claimed_cell.cell())?;
-
                 Ok(computed_cell)
             },
         )?;
-        
+
         layouter.constrain_instance(hit_cell.cell(), instance_col, 0)?;
 
         Ok(())
 
     }
-
 }
 
 // generates the proof
@@ -551,6 +754,7 @@ fn verify_proof_strat(
 
 // num of rows in curcuit which I think is 2^8 = 256 in this case (added more for poseidon hashing)
 const K: u32 = 8;
+const NUM_SHIPS: u8 = 3;
 
 // generates the default params and writes them to a file
 fn write_params() {
@@ -582,9 +786,21 @@ fn initialize_params() -> (
 
     let params = Params::<EqAffine>::read(&mut BufReader::new(params_file)).expect("Failed to read params");
 
+    let mut dummy_ships = Vec::new();
+    let mut dummy_commitments = Vec:: new();
+    
+    for _ in 0..NUM_SHIPS { // fixed fleet size of 3 ships
+        dummy_ships.push((
+            Value::unknown(),
+            Value::unknown(),
+            Value:: unknown(),
+        ));
+        dummy_commitments.push(Value::unknown());
+    }
+    
     let empty_circuit = BattleshipCircuit {
-        ships: Vec::new(),
-        published_commitments: Vec::new(),
+        ships: dummy_ships,  // had to switch to NUM_SHIPS (3) because not having a fixed size caused issues with keygen not sure why
+        published_commitments: dummy_commitments,
         attack_x: Value::unknown(),
         attack_y: Value::unknown(),
         hit: Value::unknown(),
@@ -617,7 +833,8 @@ pub fn run() {
     let (params, pk, vk) = initialize_params();
 
     let grid_size = 10u8;
-    let num_ships = get_input("Enter the number of ships: ");
+    let num_ships = NUM_SHIPS;
+    println!("Using a fixed fleet size of {} ships", num_ships);
 
     let mut player_game = BattleshipGame::new(grid_size as usize);
     let mut computer_game = BattleshipGame::new(grid_size as usize);
